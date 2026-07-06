@@ -4,7 +4,7 @@ A ComfyUI custom node pack that drives a local [`llama-server`](https://github.c
 
 The main node launches `llama-server`, waits for it to become healthy, sends an OpenAI-compatible chat completion request with image input embedded as base64 data URLs, and returns the model's text response as a `STRING` output that can be fed directly into the rest of the graph.
 
-<img width="2082" height="1094" alt="2026-07-07_05-15" src="https://github.com/user-attachments/assets/962fc3f9-620a-481c-970a-499f94fdf1ff" />
+<img width="2015" height="1089" alt="2026-07-07_05-15" src="https://github.com/user-attachments/assets/affea971-438c-4944-b740-ac634834f32a" />
 
 ## Nodes in this pack
 
