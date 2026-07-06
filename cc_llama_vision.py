@@ -1,0 +1,597 @@
+import base64
+import io
+import json
+import os
+import shutil
+import socket
+import subprocess
+import time
+import hashlib
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+import requests
+from PIL import Image
+
+# ---- Optional ComfyUI server integration (for the dynamic "refresh models" button) ----
+try:
+    from server import PromptServer
+    from aiohttp import web
+except ImportError:
+    PromptServer = None
+    web = None
+
+# ---- Optional ComfyUI model-management integration (for VRAM unload node) ----
+try:
+    import comfy.model_management as comfy_mm
+except ImportError:
+    comfy_mm = None
+
+
+# ---- Global server registry ----
+# Key: (port, model_path, mmproj_path, ctx_size, n_gpu_layers, threads, threads_batch, extra_hash)
+# Value: (subprocess.Popen, last_used_timestamp)
+_running_servers: Dict[Tuple, Tuple[subprocess.Popen, float]] = {}
+
+# Default settings
+DEFAULT_MODELS_DIR = os.path.join(os.path.expanduser("~"), "models")
+DEFAULT_LOG_PATH = os.path.join(
+    os.path.expanduser("~"), "Documents", "ComfyUI", "llama_server_debug.log"
+)
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama_vision_config.json")
+
+
+# ---- Persistent config (remembers last-used models_dir across ComfyUI restarts) ----
+
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(update: dict) -> None:
+    try:
+        cfg = _load_config()
+        cfg.update(update)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[LlamaServer] Could not save config to {CONFIG_PATH}: {e}")
+
+
+def _get_configured_models_dir() -> str:
+    cfg = _load_config()
+    d = cfg.get("models_dir")
+    if d and os.path.isdir(d):
+        return d
+    return DEFAULT_MODELS_DIR
+
+
+# ---- Helper functions ----
+
+def _get_default_server_path() -> str:
+    """
+    Return the best default for llama-server.
+
+    Preference order:
+      1. Bare 'llama-server' if it resolves on PATH right now (e.g. installed/
+         upgraded via `winget install llama.cpp` or similar). We deliberately
+         keep it as the *bare command* (not the resolved absolute path) so
+         that future winget upgrades which change the install location keep
+         working without editing this field again.
+      2. A legacy hardcoded install location, for users with an older manual
+         install that isn't on PATH.
+      3. Fall back to the bare command name and let the user fix PATH / the
+         field if it's genuinely missing (validation gives a clear error).
+    """
+    if shutil.which("llama-server"):
+        return "llama-server"
+    legacy_path = r"C:\llama.cpp\llama-server.exe"
+    if os.path.exists(legacy_path):
+        return legacy_path
+    return "llama-server"
+
+
+def _scan_gguf_models(directory: str, preferred: Optional[str] = None,
+                      name_filter: Optional[str] = None,
+                      exclude_filter: Optional[str] = None) -> List[str]:
+    """Recursively scan for .gguf files. Returns a sorted list."""
+    found = []
+    if directory and os.path.isdir(directory):
+        for root, _, files in os.walk(directory):
+            for fname in files:
+                if not fname.lower().endswith(".gguf"):
+                    continue
+                lower = fname.lower()
+                if name_filter and name_filter not in lower:
+                    continue
+                if exclude_filter and exclude_filter in lower:
+                    continue
+                found.append(os.path.join(root, fname))
+    found.sort()
+    if not found and preferred:
+        found = [preferred]
+    return found if found else [f"(no .gguf files found under {directory})"]
+
+
+def _port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _wait_for_health(port: int, timeout_s: int, proc: subprocess.Popen) -> bool:
+    url = f"http://127.0.0.1:{port}/health"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            r = requests.get(url, timeout=2)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _tensor_to_data_url(image_tensor, format="JPEG") -> str:
+    """Convert a ComfyUI image tensor to a data URL, using JPEG to reduce size."""
+    img = image_tensor[0].cpu().numpy()
+    img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    pil_img = Image.fromarray(img)
+    buf = io.BytesIO()
+    pil_img.save(buf, format=format, quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{format.lower()};base64,{b64}"
+
+
+def _kill_server_proc(proc: subprocess.Popen, timeout: int = 10) -> None:
+    if proc.poll() is None:
+        proc.kill()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# ---- Dynamic models-dir API route ----
+# Lets the frontend "Refresh Models" button rescan a folder the user just
+# typed into the models_dir widget, without needing a full ComfyUI page
+# reload. See js/llama_vision.js for the companion widget.
+if PromptServer is not None and web is not None:
+
+    @PromptServer.instance.routes.post("/llama_vision/scan_models")
+    async def _llama_vision_scan_models(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        directory = (data or {}).get("dir") or DEFAULT_MODELS_DIR
+        directory = os.path.expanduser(directory)
+
+        if not os.path.isdir(directory):
+            return web.json_response(
+                {"error": f"Not a valid directory: {directory}",
+                 "models": [f"(no .gguf files found under {directory})"],
+                 "mmproj": [f"(no .gguf files found under {directory})"]},
+                status=200,
+            )
+
+        models = _scan_gguf_models(directory, exclude_filter="mmproj")
+        mmproj = _scan_gguf_models(directory, name_filter="mmproj")
+        _save_config({"models_dir": directory})
+        return web.json_response({"models": models, "mmproj": mmproj})
+
+
+# ---- Main Node Class ----
+
+class LlamaServerVisionCaption:
+    @classmethod
+    def INPUT_TYPES(cls):
+        models_dir = _get_configured_models_dir()
+        model_list = _scan_gguf_models(models_dir, None, exclude_filter="mmproj")
+        mmproj_list = _scan_gguf_models(models_dir, None, name_filter="mmproj")
+
+        return {
+            "required": {
+                "llama_server_path": ("STRING", {"default": _get_default_server_path()}),
+                "models_dir": ("STRING", {"default": models_dir}),
+                "model_path": (model_list,),
+                "mmproj_path": (mmproj_list,),
+                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "user_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "port": ("INT", {"default": 8080, "min": 1024, "max": 65535}),
+                "n_gpu_layers": ("INT", {"default": 99, "min": 0, "max": 200}),
+                "ctx_size": ("INT", {"default": 8192, "min": 512, "max": 131072}),
+                "max_tokens": ("INT", {"default": 2048, "min": 16, "max": 8192}),
+                "seed": ("INT", {"default": 0, "min": -1, "max": 0xFFFFFFFFFFFFFFFF,
+                                  "control_after_generate": "fixed"}),
+                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 64, "min": 0, "max": 1000}),
+                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "disable_thinking": ("BOOLEAN", {"default": True}),
+                "startup_timeout_s": ("INT", {"default": 60, "min": 5, "max": 300}),
+                "request_timeout_s": ("INT", {"default": 300, "min": 30, "max": 1800}),
+                "max_video_frames": ("INT", {"default": 16, "min": 1, "max": 64}),
+                "label_video_frames": ("BOOLEAN", {"default": True}),
+                "keep_server_alive": ("BOOLEAN", {"default": False, "label": "Keep server alive (reuse across runs)"}),
+                "idle_timeout_s": ("INT", {"default": 60, "min": 0, "max": 3600, "label": "Auto-unload idle timeout (0=never)"}),
+                "force_restart": ("BOOLEAN", {"default": False, "label": "Force restart server (ignore existing)"}),
+                "debug": ("BOOLEAN", {"default": True}),
+                "server_log_path": ("STRING", {"default": DEFAULT_LOG_PATH}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "image_batch": ("IMAGE",),
+                "video_frames": ("IMAGE",),
+                "stop_sequences": ("STRING", {"multiline": True, "default": ""}),
+                "extra_server_args": ("STRING", {"default": ""}),
+                "threads": ("INT", {"default": 0, "min": 0, "max": 256, "label": "CPU threads (0=auto)"}),
+                "threads_batch": ("INT", {"default": 0, "min": 0, "max": 256, "label": "Batch threads (0=auto)"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("caption",)
+    FUNCTION = "run"
+    CATEGORY = "llama.cpp"
+
+    @classmethod
+    def set_models_dir(cls, dir_path: str):
+        """Kept for backward compatibility / scripted use. Prefer editing the
+        models_dir widget + the 'Refresh Models' button, which persists to
+        llama_vision_config.json automatically."""
+        _save_config({"models_dir": dir_path})
+
+    def _validate_file(self, path: str, desc: str) -> None:
+        """Check if a file exists as absolute path or is resolvable via PATH."""
+        if os.path.exists(path):
+            return
+        if shutil.which(path) is not None:
+            return
+        raise FileNotFoundError(
+            f"{desc} not found: {path}. "
+            "If you installed via winget (e.g. `winget install llama.cpp`), try using "
+            "'llama-server' (without a path) so it resolves from PATH. "
+            "Otherwise, provide the full path to the executable."
+        )
+
+    def _server_key(self, port: int, model_path: str, mmproj_path: str,
+                    ctx_size: int, n_gpu_layers: int, extra_args: str,
+                    threads: int, threads_batch: int) -> Tuple:
+        """Generate a unique key for a server configuration."""
+        extra_hash = hashlib.md5(extra_args.encode()).hexdigest() if extra_args else ""
+        return (port, model_path, mmproj_path, ctx_size, n_gpu_layers,
+                threads, threads_batch, extra_hash)
+
+    def _get_or_start_server(self, llama_server_path: str, model_path: str,
+                             mmproj_path: str, port: int, n_gpu_layers: int,
+                             ctx_size: int, startup_timeout_s: int,
+                             server_log_path: str, extra_server_args: str,
+                             threads: int, threads_batch: int,
+                             force_restart: bool, idle_timeout_s: int) -> subprocess.Popen:
+        """Retrieve existing server if valid, or start a new one."""
+        key = self._server_key(port, model_path, mmproj_path, ctx_size,
+                               n_gpu_layers, extra_server_args, threads, threads_batch)
+
+        # Force restart: kill any existing server with this key
+        if force_restart and key in _running_servers:
+            proc, _ = _running_servers[key]
+            if proc.poll() is None:
+                print(f"[LlamaServer] Force restart: killing server on port {port}")
+                _kill_server_proc(proc, timeout=5)
+            del _running_servers[key]
+            # Give OS a moment to release the port
+            time.sleep(0.2)
+
+        # Check for existing server (now possibly removed)
+        if key in _running_servers:
+            proc, last_used = _running_servers[key]
+            if proc.poll() is None:
+                # Process alive – check idle timeout
+                if idle_timeout_s > 0 and (time.time() - last_used) > idle_timeout_s:
+                    print(f"[LlamaServer] Idle timeout ({idle_timeout_s}s) reached, killing server on port {port}")
+                    _kill_server_proc(proc, timeout=5)
+                    del _running_servers[key]
+                else:
+                    # Valid and not idle – reuse
+                    return proc
+            else:
+                # Process dead – remove from registry
+                del _running_servers[key]
+
+        # If port still in use, raise error (unless it's our just-killed process)
+        if _port_in_use(port):
+            raise RuntimeError(
+                f"Port {port} is already in use. Please free it or choose a different port."
+            )
+
+        # Start new server
+        exe_path = shutil.which(llama_server_path) if not os.path.exists(llama_server_path) else llama_server_path
+        if exe_path is None:
+            raise FileNotFoundError(f"Unable to locate executable: {llama_server_path}")
+
+        cmd = [
+            exe_path,
+            "-m", model_path,
+            "--mmproj", mmproj_path,
+            "--port", str(port),
+            "-ngl", str(n_gpu_layers),
+            "--ctx-size", str(ctx_size),
+            "--jinja",
+        ]
+        if threads > 0:
+            cmd += ["--threads", str(threads)]
+        if threads_batch > 0:
+            cmd += ["--threads-batch", str(threads_batch)]
+        if extra_server_args.strip():
+            # Simple split; for advanced cases consider shlex.split
+            cmd.extend(extra_server_args.strip().split())
+
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+
+        log_dir = os.path.dirname(server_log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        log_f = open(server_log_path, "w", encoding="utf-8", errors="replace")
+
+        print(f"[LlamaServer] Starting server on port {port}...")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+
+        if not _wait_for_health(port, startup_timeout_s, proc):
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited early (code {proc.poll()}). Check log: {server_log_path}"
+                )
+            else:
+                raise RuntimeError(
+                    f"llama-server did not become healthy within {startup_timeout_s}s. Check log: {server_log_path}"
+                )
+
+        print(f"[LlamaServer] Server ready on port {port}")
+        _running_servers[key] = (proc, time.time())
+        return proc
+
+    def _update_last_used(self, key: Tuple):
+        if key in _running_servers:
+            proc, _ = _running_servers[key]
+            _running_servers[key] = (proc, time.time())
+
+    def run(self, llama_server_path, models_dir, model_path, mmproj_path,
+            system_prompt, user_prompt, port, n_gpu_layers, ctx_size,
+            max_tokens, seed, temperature, top_p, top_k, min_p,
+            repeat_penalty, presence_penalty, frequency_penalty,
+            disable_thinking, startup_timeout_s, request_timeout_s,
+            max_video_frames, label_video_frames, keep_server_alive,
+            force_restart, idle_timeout_s, debug, server_log_path,
+            image=None, image_batch=None, video_frames=None,
+            stop_sequences="", extra_server_args="",
+            threads=0, threads_batch=0):
+
+        # Persist the models_dir the user is actually using, so it's
+        # remembered as the default next time ComfyUI (re)loads this node.
+        if models_dir and os.path.isdir(models_dir):
+            _save_config({"models_dir": models_dir})
+
+        # Validate files
+        self._validate_file(llama_server_path, "llama-server executable")
+        self._validate_file(model_path, "Model file")
+        self._validate_file(mmproj_path, "mmproj file")
+
+        proc = None
+        server_key = None
+        try:
+            if keep_server_alive:
+                proc = self._get_or_start_server(
+                    llama_server_path, model_path, mmproj_path, port,
+                    n_gpu_layers, ctx_size, startup_timeout_s,
+                    server_log_path, extra_server_args, threads, threads_batch,
+                    force_restart, idle_timeout_s
+                )
+                server_key = self._server_key(port, model_path, mmproj_path, ctx_size,
+                                              n_gpu_layers, extra_server_args, threads, threads_batch)
+            else:
+                # Start a temporary server (will be killed after request)
+                if _port_in_use(port):
+                    raise RuntimeError(
+                        f"Port {port} is already in use. Either free it, choose another port, "
+                        "or enable 'keep_server_alive' to reuse an existing server."
+                    )
+                proc = self._get_or_start_server(
+                    llama_server_path, model_path, mmproj_path, port,
+                    n_gpu_layers, ctx_size, startup_timeout_s,
+                    server_log_path, extra_server_args, threads, threads_batch,
+                    force_restart=False, idle_timeout_s=0  # no auto-unload for temp
+                )
+
+            # ---- Build multimodal content ----
+            content_items = []
+            if image is not None:
+                content_items.append(("image", image[0:1]))
+            if image_batch is not None:
+                for i in range(image_batch.shape[0]):
+                    content_items.append(("image", image_batch[i:i+1]))
+            if video_frames is not None:
+                total = video_frames.shape[0]
+                if total > max_video_frames:
+                    idxs = sorted(set(
+                        np.linspace(0, total - 1, max_video_frames).round().astype(int).tolist()
+                    ))
+                else:
+                    idxs = list(range(total))
+                for idx in idxs:
+                    if label_video_frames:
+                        content_items.append(("text", f"[Video frame {idx+1} of {total}]"))
+                    content_items.append(("image", video_frames[idx:idx+1]))
+
+            user_content = []
+            if content_items:
+                for kind, payload in content_items:
+                    if kind == "image":
+                        data_url = _tensor_to_data_url(payload, format="JPEG")
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": data_url}
+                        })
+                    else:
+                        user_content.append({"type": "text", "text": payload})
+                user_content.append({"type": "text", "text": user_prompt})
+            else:
+                user_content = user_prompt
+
+            # ---- Prepare API payload ----
+            payload = {
+                "model": "vision-caption",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                "max_tokens": max_tokens,
+                "seed": seed,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "repeat_penalty": repeat_penalty,
+                "presence_penalty": presence_penalty,
+                "frequency_penalty": frequency_penalty,
+            }
+
+            stops = [s.strip() for s in stop_sequences.splitlines() if s.strip()]
+            if stops:
+                payload["stop"] = stops
+
+            if disable_thinking:
+                payload["chat_template_kwargs"] = {"thinking": False}
+
+            # ---- Send request ----
+            resp = requests.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=payload,
+                timeout=request_timeout_s,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if debug:
+                print("[LlamaServerVisionCaption] Raw response:")
+                print(json.dumps(data, indent=2)[:4000])
+
+            message = data["choices"][0]["message"]
+            finish_reason = data["choices"][0].get("finish_reason")
+            caption = message.get("content") or ""
+
+            if not caption.strip():
+                reasoning = message.get("reasoning_content") or ""
+                if reasoning.strip():
+                    caption = (
+                        f"[empty 'content' field — model likely still reasoning "
+                        f"when max_tokens was hit (finish_reason={finish_reason}). "
+                        f"reasoning_content was:]\n\n{reasoning}"
+                    )
+                else:
+                    caption = (
+                        f"[no text returned — finish_reason={finish_reason}. "
+                        f"Check {server_log_path} for template/vision errors. "
+                        f"Raw message: {json.dumps(message)[:1000]}]"
+                    )
+
+            # Update last used time if persistent server
+            if keep_server_alive and server_key:
+                self._update_last_used(server_key)
+
+            return (caption,)
+
+        finally:
+            # If not keeping alive, kill the temporary server
+            if not keep_server_alive and proc is not None:
+                _kill_server_proc(proc, timeout=10)
+                # Remove from registry if present (shouldn't be)
+                for key, (p, _) in list(_running_servers.items()):
+                    if p == proc:
+                        del _running_servers[key]
+                        break
+                print("[LlamaServer] Temporary server stopped.")
+
+
+# ---- VRAM handoff node ----
+# llama-server runs as an external subprocess, so ComfyUI's own model
+# manager has no idea it is holding VRAM. If a workflow does
+# "caption with the LLM" -> "generate an image with a big diffusion model"
+# in two separate steps, the second step can OOM because the LLM never got
+# unloaded. Chain this node between the caption node and whatever consumes
+# its text (e.g. a CLIPTextEncode "text" input) — since ComfyUI executes in
+# dependency order, that link *guarantees* the llama-server is killed before
+# the image-model node runs, without needing timers or guesswork.
+class LlamaServerUnload:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "trigger": ("STRING", {"forceInput": True}),
+                "target": (["all_servers", "specific_port"], {"default": "all_servers"}),
+                "also_free_comfyui_vram": ("BOOLEAN", {
+                    "default": True,
+                    "label": "Also unload ComfyUI's own models / empty cache"
+                }),
+            },
+            "optional": {
+                "port": ("INT", {"default": 8080, "min": 1024, "max": 65535}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("trigger",)
+    FUNCTION = "unload"
+    CATEGORY = "llama.cpp"
+    OUTPUT_NODE = False
+
+    def unload(self, trigger, target, also_free_comfyui_vram, port=8080):
+        killed_ports = []
+        for key, (proc, _) in list(_running_servers.items()):
+            key_port = key[0]
+            if target == "all_servers" or key_port == port:
+                _kill_server_proc(proc, timeout=10)
+                del _running_servers[key]
+                killed_ports.append(key_port)
+
+        if killed_ports:
+            print(f"[LlamaServerUnload] Killed llama-server(s) on port(s): {killed_ports}")
+        else:
+            print("[LlamaServerUnload] No matching llama-server was running.")
+
+        if also_free_comfyui_vram and comfy_mm is not None:
+            try:
+                comfy_mm.unload_all_models()
+                comfy_mm.soft_empty_cache()
+                print("[LlamaServerUnload] Freed ComfyUI-managed VRAM cache.")
+            except Exception as e:
+                print(f"[LlamaServerUnload] Could not free ComfyUI VRAM cache: {e}")
+
+        return (trigger,)
+
+
+# ---- ComfyUI Node Registration ----
+NODE_CLASS_MAPPINGS = {
+    "LlamaServerVisionCaption": LlamaServerVisionCaption,
+    "LlamaServerUnload": LlamaServerUnload,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "LlamaServerVisionCaption": "CC Llama Vision",
+    "LlamaServerUnload": "CC Llama Server Unload (free VRAM)",
+}
