@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+llama_vision_config.json
