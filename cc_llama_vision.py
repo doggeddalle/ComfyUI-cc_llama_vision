@@ -30,8 +30,8 @@ except ImportError:
 
 # ---- Global server registry ----
 # Key: (port, model_path, mmproj_path, ctx_size, n_gpu_layers, threads, threads_batch, extra_hash)
-# Value: (subprocess.Popen, last_used_timestamp)
-_running_servers: Dict[Tuple, Tuple[subprocess.Popen, float]] = {}
+# Value: (subprocess.Popen, last_used_timestamp, file_handle)
+_running_servers: Dict[Tuple, Tuple[subprocess.Popen, float, Optional[Any]]] = {}
 
 # Default settings
 DEFAULT_MODELS_DIR = os.path.join(os.path.expanduser("~"), "models")
@@ -149,12 +149,17 @@ def _tensor_to_data_url(image_tensor, format="JPEG") -> str:
     return f"data:image/{format.lower()};base64,{b64}"
 
 
-def _kill_server_proc(proc: subprocess.Popen, timeout: int = 10) -> None:
+def _kill_server_proc(proc: subprocess.Popen, timeout: int = 10, log_handle: Optional[Any] = None) -> None:
     if proc.poll() is None:
         proc.kill()
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            pass
+    if log_handle is not None:
+        try:
+            log_handle.close()
+        except Exception:
             pass
 
 
@@ -284,22 +289,22 @@ class LlamaServerVisionCaption:
 
         # Force restart: kill any existing server with this key
         if force_restart and key in _running_servers:
-            proc, _ = _running_servers[key]
+            proc, _, log_f = _running_servers[key]
             if proc.poll() is None:
                 print(f"[LlamaServer] Force restart: killing server on port {port}")
-                _kill_server_proc(proc, timeout=5)
+                _kill_server_proc(proc, timeout=5, log_handle=log_f)
             del _running_servers[key]
             # Give OS a moment to release the port
             time.sleep(0.2)
 
         # Check for existing server (now possibly removed)
         if key in _running_servers:
-            proc, last_used = _running_servers[key]
+            proc, last_used, log_f = _running_servers[key]
             if proc.poll() is None:
                 # Process alive – check idle timeout
                 if idle_timeout_s > 0 and (time.time() - last_used) > idle_timeout_s:
                     print(f"[LlamaServer] Idle timeout ({idle_timeout_s}s) reached, killing server on port {port}")
-                    _kill_server_proc(proc, timeout=5)
+                    _kill_server_proc(proc, timeout=5, log_handle=log_f)
                     del _running_servers[key]
                 else:
                     # Valid and not idle – reuse
@@ -345,32 +350,38 @@ class LlamaServerVisionCaption:
             os.makedirs(log_dir, exist_ok=True)
         log_f = open(server_log_path, "w", encoding="utf-8", errors="replace")
 
-        print(f"[LlamaServer] Starting server on port {port}...")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-        )
+        try:
+            print(f"[LlamaServer] Starting server on port {port}...")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
 
-        if not _wait_for_health(port, startup_timeout_s, proc):
-            if proc.poll() is not None:
-                raise RuntimeError(
-                    f"llama-server exited early (code {proc.poll()}). Check log: {server_log_path}"
-                )
-            else:
-                raise RuntimeError(
-                    f"llama-server did not become healthy within {startup_timeout_s}s. Check log: {server_log_path}"
-                )
+            if not _wait_for_health(port, startup_timeout_s, proc):
+                if proc.poll() is not None:
+                    log_f.close()
+                    raise RuntimeError(
+                        f"llama-server exited early (code {proc.poll()}). Check log: {server_log_path}"
+                    )
+                else:
+                    log_f.close()
+                    raise RuntimeError(
+                        f"llama-server did not become healthy within {startup_timeout_s}s. Check log: {server_log_path}"
+                    )
 
-        print(f"[LlamaServer] Server ready on port {port}")
-        _running_servers[key] = (proc, time.time())
-        return proc
+            print(f"[LlamaServer] Server ready on port {port}")
+            _running_servers[key] = (proc, time.time(), log_f)
+            return proc
+        except Exception:
+            log_f.close()
+            raise
 
     def _update_last_used(self, key: Tuple):
         if key in _running_servers:
-            proc, _ = _running_servers[key]
-            _running_servers[key] = (proc, time.time())
+            proc, _, log_f = _running_servers[key]
+            _running_servers[key] = (proc, time.time(), log_f)
 
     def run(self, llama_server_path, models_dir, model_path, mmproj_path,
             system_prompt, user_prompt, port, n_gpu_layers, ctx_size,
@@ -522,7 +533,7 @@ class LlamaServerVisionCaption:
             if not keep_server_alive and proc is not None:
                 _kill_server_proc(proc, timeout=10)
                 # Remove from registry if present (shouldn't be)
-                for key, (p, _) in list(_running_servers.items()):
+                for key, (p, _, log_f) in list(_running_servers.items()):
                     if p == proc:
                         del _running_servers[key]
                         break
@@ -563,10 +574,10 @@ class LlamaServerUnload:
 
     def unload(self, trigger, target, also_free_comfyui_vram, port=8080):
         killed_ports = []
-        for key, (proc, _) in list(_running_servers.items()):
+        for key, (proc, _, log_f) in list(_running_servers.items()):
             key_port = key[0]
             if target == "all_servers" or key_port == port:
-                _kill_server_proc(proc, timeout=10)
+                _kill_server_proc(proc, timeout=10, log_handle=log_f)
                 del _running_servers[key]
                 killed_ports.append(key_port)
 

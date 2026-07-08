@@ -3,7 +3,11 @@ name = "comfyui-cc_llama_vision"
 description = "Yet another llama_cpp node. GGUF-focused vision-language captioning via llama-server, with automatic server lifecycle management and VRAM-safe handoff."
 version = "1.0.0"
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = [
+    "numpy",
+    "requests",
+    "pillow",
+]
 
 [project.urls]
 Repository = "https://github.com/doggeddalle/ComfyUI-cc_llama_vision"
