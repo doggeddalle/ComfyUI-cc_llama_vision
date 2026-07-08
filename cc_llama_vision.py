@@ -203,44 +203,181 @@ class LlamaServerVisionCaption:
 
         return {
             "required": {
-                "llama_server_path": ("STRING", {"default": _get_default_server_path()}),
-                "models_dir": ("STRING", {"default": models_dir}),
-                "model_path": (model_list,),
-                "mmproj_path": (mmproj_list,),
-                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "user_prompt": ("STRING", {"multiline": True, "default": ""}),
-                "port": ("INT", {"default": 8080, "min": 1024, "max": 65535}),
-                "n_gpu_layers": ("INT", {"default": 99, "min": 0, "max": 200}),
-                "ctx_size": ("INT", {"default": 8192, "min": 512, "max": 131072}),
-                "max_tokens": ("INT", {"default": 2048, "min": 16, "max": 8192}),
+                "llama_server_path": ("STRING", {
+                    "default": _get_default_server_path(),
+                    "tooltip": "Path to the llama-server executable. Leave as 'llama-server' to "
+                               "resolve automatically from PATH (recommended after "
+                               "`winget install llama.cpp`), or provide a full path to "
+                               "llama-server.exe.",
+                }),
+                "models_dir": ("STRING", {
+                    "default": models_dir,
+                    "tooltip": "Folder to scan (recursively) for .gguf model and mmproj files. "
+                               "Click '🔄 Refresh Models' after changing this to repopulate the "
+                               "dropdowns below.",
+                }),
+                "model_path": (model_list, {
+                    "tooltip": "The GGUF vision-language model file to load "
+                               "(mmproj files are excluded from this list).",
+                }),
+                "mmproj_path": (mmproj_list, {
+                    "tooltip": "The GGUF multimodal projector (mmproj) file matching the selected "
+                               "model — required for image/vision input.",
+                }),
+                "system_prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "System-level instructions sent to the model before the user "
+                               "prompt, e.g. persona or output-format guidance.",
+                }),
+                "user_prompt": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "The instruction/question sent to the model along with the "
+                               "image(s). This text is appended after any images.",
+                }),
+                "port": ("INT", {
+                    "default": 8080, "min": 1024, "max": 65535,
+                    "tooltip": "Local TCP port llama-server will listen on. Must be free unless "
+                               "'keep_server_alive' is reusing an existing server on this port.",
+                }),
+                "n_gpu_layers": ("INT", {
+                    "default": 99, "min": 0, "max": 200,
+                    "tooltip": "Number of model layers to offload to GPU. Higher = faster but "
+                               "more VRAM; set to 0 for CPU-only.",
+                }),
+                "ctx_size": ("INT", {
+                    "default": 8192, "min": 512, "max": 131072,
+                    "tooltip": "Context window size (tokens) for the server. Larger allows "
+                               "longer prompts/images but uses more VRAM/RAM.",
+                }),
+                "max_tokens": ("INT", {
+                    "default": 2048, "min": 16, "max": 8192,
+                    "tooltip": "Maximum number of tokens the model may generate in its response.",
+                }),
                 "seed": ("INT", {"default": 0, "min": -1, "max": 0xFFFFFFFFFFFFFFFF,
-                                  "control_after_generate": "fixed"}),
-                "temperature": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top_k": ("INT", {"default": 64, "min": 0, "max": 1000}),
-                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "disable_thinking": ("BOOLEAN", {"default": True}),
-                "startup_timeout_s": ("INT", {"default": 60, "min": 5, "max": 300}),
-                "request_timeout_s": ("INT", {"default": 300, "min": 30, "max": 1800}),
-                "max_video_frames": ("INT", {"default": 16, "min": 1, "max": 64}),
-                "label_video_frames": ("BOOLEAN", {"default": True}),
-                "keep_server_alive": ("BOOLEAN", {"default": False, "label": "Keep server alive (reuse across runs)"}),
-                "idle_timeout_s": ("INT", {"default": 60, "min": 0, "max": 3600, "label": "Auto-unload idle timeout (0=never)"}),
-                "force_restart": ("BOOLEAN", {"default": False, "label": "Force restart server (ignore existing)"}),
-                "debug": ("BOOLEAN", {"default": True}),
-                "server_log_path": ("STRING", {"default": DEFAULT_LOG_PATH}),
+                                  "control_after_generate": "fixed",
+                                  "tooltip": "Random seed for generation. -1 for random each run; "
+                                            "a fixed value makes output reproducible."}),
+                "temperature": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Sampling temperature. Higher = more random/creative, lower = "
+                               "more deterministic/focused.",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling threshold — only tokens within this cumulative "
+                               "probability mass are considered.",
+                }),
+                "top_k": ("INT", {
+                    "default": 64, "min": 0, "max": 1000,
+                    "tooltip": "Only the top K most likely tokens are considered at each step. "
+                               "0 disables this filter.",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Minimum probability (relative to the top token) a token must "
+                               "have to be considered.",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty applied to tokens that have already appeared, to "
+                               "discourage repetition.",
+                }),
+                "presence_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty applied per unique token already present in the output, "
+                               "encouraging new topics.",
+                }),
+                "frequency_penalty": ("FLOAT", {
+                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty scaled by how often a token has already appeared, "
+                               "discouraging repetition.",
+                }),
+                "disable_thinking": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If enabled, disables the model's internal 'thinking'/reasoning "
+                               "mode (for models that support it) so it responds directly.",
+                }),
+                "startup_timeout_s": ("INT", {
+                    "default": 60, "min": 5, "max": 300,
+                    "tooltip": "How many seconds to wait for llama-server to report healthy "
+                               "before giving up on startup.",
+                }),
+                "request_timeout_s": ("INT", {
+                    "default": 300, "min": 30, "max": 1800,
+                    "tooltip": "How many seconds to wait for a response to the captioning "
+                               "request before timing out.",
+                }),
+                "max_video_frames": ("INT", {
+                    "default": 16, "min": 1, "max": 64,
+                    "tooltip": "Maximum number of frames to sample from 'video_frames' input; "
+                               "frames beyond this are evenly subsampled.",
+                }),
+                "label_video_frames": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If enabled, prefixes each video frame image with a text label "
+                               "like '[Video frame N of M]'.",
+                }),
+                "keep_server_alive": ("BOOLEAN", {
+                    "default": False, "label": "Keep server alive (reuse across runs)",
+                    "tooltip": "Keep llama-server running after this node finishes so future "
+                               "runs can reuse it instead of restarting (faster, but keeps "
+                               "VRAM occupied).",
+                }),
+                "idle_timeout_s": ("INT", {
+                    "default": 60, "min": 0, "max": 3600,
+                    "label": "Auto-unload idle timeout (0=never)",
+                    "tooltip": "If a kept-alive server goes unused for this many seconds, it "
+                               "will be automatically killed to free VRAM. 0 disables "
+                               "auto-unload.",
+                }),
+                "force_restart": ("BOOLEAN", {
+                    "default": False, "label": "Force restart server (ignore existing)",
+                    "tooltip": "Kill and restart any matching existing server before running, "
+                               "even if one is already alive and healthy.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Print the raw JSON response from llama-server to the console "
+                               "for troubleshooting.",
+                }),
+                "server_log_path": ("STRING", {
+                    "default": DEFAULT_LOG_PATH,
+                    "tooltip": "File path where llama-server's stdout/stderr log will be "
+                               "written — check this file if startup fails.",
+                }),
             },
             "optional": {
-                "image": ("IMAGE",),
-                "image_batch": ("IMAGE",),
-                "video_frames": ("IMAGE",),
-                "stop_sequences": ("STRING", {"multiline": True, "default": ""}),
-                "extra_server_args": ("STRING", {"default": ""}),
-                "threads": ("INT", {"default": 0, "min": 0, "max": 256, "label": "CPU threads (0=auto)"}),
-                "threads_batch": ("INT", {"default": 0, "min": 0, "max": 256, "label": "Batch threads (0=auto)"}),
+                "image": ("IMAGE", {
+                    "tooltip": "A single image to send to the model.",
+                }),
+                "image_batch": ("IMAGE", {
+                    "tooltip": "A batch of images; each is sent as a separate image in the "
+                               "same message.",
+                }),
+                "video_frames": ("IMAGE", {
+                    "tooltip": "A sequence of image frames (e.g. from a video) to sample and "
+                               "send to the model, subject to max_video_frames.",
+                }),
+                "stop_sequences": ("STRING", {
+                    "multiline": True, "default": "",
+                    "tooltip": "One stop string per line; generation halts early if any of "
+                               "these strings are produced.",
+                }),
+                "extra_server_args": ("STRING", {
+                    "default": "",
+                    "tooltip": "Additional raw command-line arguments passed through to "
+                               "llama-server (advanced use).",
+                }),
+                "threads": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "label": "CPU threads (0=auto)",
+                    "tooltip": "Number of CPU threads for generation. 0 = let llama-server "
+                               "auto-detect.",
+                }),
+                "threads_batch": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "label": "Batch threads (0=auto)",
+                    "tooltip": "Number of CPU threads for batch/prompt processing. 0 = let "
+                               "llama-server auto-detect.",
+                }),
             },
         }
 
@@ -257,16 +394,65 @@ class LlamaServerVisionCaption:
         _save_config({"models_dir": dir_path})
 
     def _validate_file(self, path: str, desc: str) -> None:
-        """Check if a file exists as absolute path or is resolvable via PATH."""
+        """Check if a file (model / mmproj) exists as an absolute/relative path."""
+        if os.path.exists(path):
+            return
+        raise FileNotFoundError(
+            f"{desc} not found: {path}. Double-check the 'models_dir' widget and the "
+            "selected dropdown value, then click '🔄 Refresh Models' to rescan."
+        )
+
+    def _validate_executable(self, path: str, desc: str = "llama-server executable") -> None:
+        """Check whether the llama-server executable can be located.
+
+        Detection order (mirrors _get_default_server_path / _get_or_start_server):
+          1. `path` exists directly on disk (absolute or relative file path).
+          2. `path` resolves via shutil.which(), i.e. it is a bare command name
+             (or a path) findable on the current process's PATH environment
+             variable. This is what lets the 'llama-server' default keep working
+             across winget upgrades that change the underlying install folder.
+
+        If neither succeeds, raise a verbose, actionable error explaining how to
+        install llama.cpp via winget on Windows, or how to add an existing
+        install to PATH manually, since a missing/unresolvable executable is by
+        far the most common setup problem for this node.
+        """
         if os.path.exists(path):
             return
         if shutil.which(path) is not None:
             return
+
         raise FileNotFoundError(
-            f"{desc} not found: {path}. "
-            "If you installed via winget (e.g. `winget install llama.cpp`), try using "
-            "'llama-server' (without a path) so it resolves from PATH. "
-            "Otherwise, provide the full path to the executable."
+            f"{desc} not found: '{path}'.\n\n"
+            "llama-server could not be located either as a direct file path or "
+            "anywhere on your system PATH. Here's how to fix it:\n\n"
+            "== Option 1: Install/upgrade via winget (recommended on Windows) ==\n"
+            "  1. Open a new PowerShell or Command Prompt window.\n"
+            "  2. Run:\n"
+            "       winget install llama.cpp\n"
+            "     (already installed? upgrade instead with: winget upgrade llama.cpp)\n"
+            "  3. Fully close and reopen ComfyUI (and any terminal windows) so the "
+            "updated PATH is picked up by new processes.\n"
+            "  4. Set the 'llama_server_path' widget to just:\n"
+            "       llama-server\n"
+            "     Leave off any folder — that way it keeps resolving via PATH even "
+            "after future winget upgrades move the install location.\n\n"
+            "== Option 2: Add an existing install to PATH manually (Windows) ==\n"
+            "  1. Find the folder containing llama-server.exe "
+            "(e.g. C:\\llama.cpp).\n"
+            "  2. Press Win, search for 'Environment Variables', open "
+            "'Edit the system environment variables'.\n"
+            "  3. Click 'Environment Variables...' -> select 'Path' under "
+            "'User variables' (or 'System variables') -> 'Edit...' -> 'New' -> "
+            "paste the folder path -> OK on all open dialogs.\n"
+            "  4. Or, from PowerShell (current user only, no admin needed):\n"
+            "       setx PATH \"$env:PATH;C:\\llama.cpp\"\n"
+            "  5. Fully close and reopen ComfyUI/terminal windows, then set "
+            "'llama_server_path' to: llama-server\n\n"
+            "== Option 3: Just use a full path ==\n"
+            "  Skip PATH entirely and point 'llama_server_path' straight at the "
+            "executable, e.g.:\n"
+            "       C:\\llama.cpp\\llama-server.exe\n"
         )
 
     def _server_key(self, port: int, model_path: str, mmproj_path: str,
@@ -320,9 +506,8 @@ class LlamaServerVisionCaption:
             )
 
         # Start new server
+        self._validate_executable(llama_server_path)
         exe_path = shutil.which(llama_server_path) if not os.path.exists(llama_server_path) else llama_server_path
-        if exe_path is None:
-            raise FileNotFoundError(f"Unable to locate executable: {llama_server_path}")
 
         cmd = [
             exe_path,
@@ -400,7 +585,7 @@ class LlamaServerVisionCaption:
             _save_config({"models_dir": models_dir})
 
         # Validate files
-        self._validate_file(llama_server_path, "llama-server executable")
+        self._validate_executable(llama_server_path, "llama-server executable")
         self._validate_file(model_path, "Model file")
         self._validate_file(mmproj_path, "mmproj file")
 
@@ -554,15 +739,30 @@ class LlamaServerUnload:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "trigger": ("STRING", {"forceInput": True}),
-                "target": (["all_servers", "specific_port"], {"default": "all_servers"}),
+                "trigger": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "Upstream string output to chain from (e.g. the caption output) "
+                               "— guarantees this node runs before whatever consumes it, since "
+                               "ComfyUI executes in dependency order.",
+                }),
+                "target": (["all_servers", "specific_port"], {
+                    "default": "all_servers",
+                    "tooltip": "Which server(s) to kill: every currently tracked llama-server "
+                               "process, or only the one on the specified port.",
+                }),
                 "also_free_comfyui_vram": ("BOOLEAN", {
                     "default": True,
-                    "label": "Also unload ComfyUI's own models / empty cache"
+                    "label": "Also unload ComfyUI's own models / empty cache",
+                    "tooltip": "Also ask ComfyUI to unload its own loaded models and empty its "
+                               "VRAM cache after killing llama-server.",
                 }),
             },
             "optional": {
-                "port": ("INT", {"default": 8080, "min": 1024, "max": 65535}),
+                "port": ("INT", {
+                    "default": 8080, "min": 1024, "max": 65535,
+                    "tooltip": "Port of the specific llama-server to kill, used only when "
+                               "'target' is 'specific_port'.",
+                }),
             },
         }
 
