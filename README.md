@@ -68,6 +68,15 @@ ComfyUI/custom_nodes/ComfyUI-cc_llama_vision/
 
 Restart ComfyUI. The `js/` folder is served automatically via `WEB_DIRECTORY` and adds the Refresh Models button to the node UI.
 
+## Registry / security notes
+
+This node is designed to be safe and reviewable for ComfyUI Manager and the Registry:
+
+- It does not use `eval`, `exec`, or other dynamic code execution paths.
+- It does not install Python packages or run `pip` at runtime.
+- It only launches a local external process (`llama-server`) when configured by the user.
+- Required Python dependencies are declared in both `pyproject.toml` and `requirements.txt` so they can be installed consistently.
+
 ## Requirements
 
 - A working `llama-server` build from llama.cpp, either available on `PATH` (recommended, for example via `winget install llama.cpp`) or at a path specified in `llama_server_path`.

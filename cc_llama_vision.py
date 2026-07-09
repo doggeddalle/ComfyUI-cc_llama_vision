@@ -1,12 +1,13 @@
 import base64
+import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
 import time
-import hashlib
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -523,8 +524,10 @@ class LlamaServerVisionCaption:
         if threads_batch > 0:
             cmd += ["--threads-batch", str(threads_batch)]
         if extra_server_args.strip():
-            # Simple split; for advanced cases consider shlex.split
-            cmd.extend(extra_server_args.strip().split())
+            try:
+                cmd.extend(shlex.split(extra_server_args, posix=os.name != "nt"))
+            except ValueError as exc:
+                raise ValueError(f"Could not parse extra_server_args: {exc}") from exc
 
         creationflags = 0
         if os.name == "nt":
