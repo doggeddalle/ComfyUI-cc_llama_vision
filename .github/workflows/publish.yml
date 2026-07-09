@@ -10,7 +10,8 @@ on:
 jobs:
   publish-node:
     name: Publish Custom Node to registry
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - name: Check out code
         uses: actions/checkout@v4
