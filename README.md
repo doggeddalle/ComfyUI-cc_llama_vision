@@ -13,7 +13,9 @@ The core node, CC Llama Vision, will:
 - send the prompt plus image or video content to the server
 - return the generated caption as a STRING output
 
-A second node, CC Llama Server Unload, can be inserted later in the workflow to explicitly free VRAM by stopping the server before downstream image-generation steps run.
+An optional node, CC Llama Vision Advanced Options, holds the sampling, performance, lifecycle, and diagnostics settings and plugs into the main node's `advanced_options` input — leave it disconnected to just use sensible defaults.
+
+A third node, CC Llama Server Unload, can be inserted later in the workflow to explicitly free VRAM by stopping the server before downstream image-generation steps run.
 
 ## Nodes
 
@@ -24,7 +26,17 @@ Use this node when you want to generate captions from:
 - a batch of images
 - sampled video frames
 
-It supports prompt controls, sampling parameters, and direct connection to the rest of your graph.
+It handles model/mmproj selection, prompts, media inputs, and direct connection to the rest of your graph. Connect a CC Llama Vision Advanced Options node to its `advanced_options` input for finer control over sampling and server behavior.
+
+### CC Llama Vision Advanced Options
+Optional node that bundles the less-frequently-tweaked settings into a single output, so the main node stays uncluttered:
+
+- sampling: temperature, top_p, top_k, min_p, repeat_penalty, presence_penalty, frequency_penalty, seed, disable_thinking, stop_sequences
+- performance: n_gpu_layers, ctx_size, threads, threads_batch, extra_server_args
+- lifecycle: keep_server_alive, idle_timeout_s, force_restart, startup_timeout_s, request_timeout_s
+- diagnostics: debug, server_log_path
+
+Connect its `advanced_options` output to the main node's `advanced_options` input. If left disconnected, the main node falls back to the same defaults this node ships with.
 
 ### CC Llama Server Unload
 Use this node as a VRAM-safe handoff point in mixed LLM + image-generation workflows.
@@ -32,7 +44,9 @@ Use this node as a VRAM-safe handoff point in mixed LLM + image-generation workf
 It is especially useful when you want to ensure the llama-server process is stopped before a diffusion model loads later in the same graph.
 
 ```text
-CC Llama Vision → CC Llama Server Unload → CLIPTextEncode.text → KSampler → ...
+CC Llama Vision Advanced Options ─┐
+                                   ├─→ CC Llama Vision → CC Llama Server Unload → CLIPTextEncode.text → KSampler → ...
+                (media inputs) ────┘
 ```
 
 ## Key features
@@ -77,12 +91,16 @@ The recommended setup is to make llama-server available on PATH, for example via
 ## Inputs at a glance
 
 ### CC Llama Vision
-- Server: llama_server_path, models_dir, model_path, mmproj_path, port, n_gpu_layers, ctx_size, threads, threads_batch, extra_server_args
-- Lifecycle: keep_server_alive, idle_timeout_s, force_restart, startup_timeout_s
-- Prompting: system_prompt, user_prompt, stop_sequences, disable_thinking
-- Sampling: temperature, top_p, top_k, min_p, repeat_penalty, presence_penalty, frequency_penalty, seed, max_tokens
+- Server: llama_server_path, models_dir, model_path, mmproj_path, port
+- Prompting: system_prompt, user_prompt, max_tokens
 - Media: image, image_batch, video_frames, max_video_frames, label_video_frames
-- Diagnostics: debug, server_log_path, request_timeout_s
+- Advanced: advanced_options (optional input from CC Llama Vision Advanced Options)
+
+### CC Llama Vision Advanced Options
+- Sampling: temperature, top_p, top_k, min_p, repeat_penalty, presence_penalty, frequency_penalty, seed, disable_thinking, stop_sequences
+- Performance: n_gpu_layers, ctx_size, threads, threads_batch, extra_server_args
+- Lifecycle: keep_server_alive, idle_timeout_s, force_restart, startup_timeout_s, request_timeout_s
+- Diagnostics: debug, server_log_path
 
 ### CC Llama Server Unload
 - trigger

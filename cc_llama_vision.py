@@ -41,6 +41,34 @@ DEFAULT_LOG_PATH = os.path.join(
 )
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llama_vision_config.json")
 
+# Defaults for everything the "CC Llama Vision Advanced Options" node produces.
+# Used both as that node's widget defaults and as the fallback the main node
+# applies when no advanced_options input is connected, so the two stay in sync.
+DEFAULT_ADVANCED_OPTS: Dict[str, Any] = {
+    "n_gpu_layers": 99,
+    "ctx_size": 8192,
+    "threads": 0,
+    "threads_batch": 0,
+    "extra_server_args": "",
+    "seed": 0,
+    "temperature": 0.9,
+    "top_p": 0.9,
+    "top_k": 64,
+    "min_p": 0.0,
+    "repeat_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "disable_thinking": True,
+    "stop_sequences": "",
+    "startup_timeout_s": 60,
+    "request_timeout_s": 300,
+    "keep_server_alive": False,
+    "idle_timeout_s": 60,
+    "force_restart": False,
+    "debug": True,
+    "server_log_path": DEFAULT_LOG_PATH,
+}
+
 
 # ---- Persistent config (remembers last-used models_dir across ComfyUI restarts) ----
 
@@ -240,73 +268,9 @@ class LlamaServerVisionCaption:
                     "tooltip": "Local TCP port llama-server will listen on. Must be free unless "
                                "'keep_server_alive' is reusing an existing server on this port.",
                 }),
-                "n_gpu_layers": ("INT", {
-                    "default": 99, "min": 0, "max": 200,
-                    "tooltip": "Number of model layers to offload to GPU. Higher = faster but "
-                               "more VRAM; set to 0 for CPU-only.",
-                }),
-                "ctx_size": ("INT", {
-                    "default": 8192, "min": 512, "max": 131072,
-                    "tooltip": "Context window size (tokens) for the server. Larger allows "
-                               "longer prompts/images but uses more VRAM/RAM.",
-                }),
                 "max_tokens": ("INT", {
                     "default": 2048, "min": 16, "max": 8192,
                     "tooltip": "Maximum number of tokens the model may generate in its response.",
-                }),
-                "seed": ("INT", {"default": 0, "min": -1, "max": 0xFFFFFFFFFFFFFFFF,
-                                  "control_after_generate": "fixed",
-                                  "tooltip": "Random seed for generation. -1 for random each run; "
-                                            "a fixed value makes output reproducible."}),
-                "temperature": ("FLOAT", {
-                    "default": 0.9, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Sampling temperature. Higher = more random/creative, lower = "
-                               "more deterministic/focused.",
-                }),
-                "top_p": ("FLOAT", {
-                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Nucleus sampling threshold — only tokens within this cumulative "
-                               "probability mass are considered.",
-                }),
-                "top_k": ("INT", {
-                    "default": 64, "min": 0, "max": 1000,
-                    "tooltip": "Only the top K most likely tokens are considered at each step. "
-                               "0 disables this filter.",
-                }),
-                "min_p": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Minimum probability (relative to the top token) a token must "
-                               "have to be considered.",
-                }),
-                "repeat_penalty": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Penalty applied to tokens that have already appeared, to "
-                               "discourage repetition.",
-                }),
-                "presence_penalty": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Penalty applied per unique token already present in the output, "
-                               "encouraging new topics.",
-                }),
-                "frequency_penalty": ("FLOAT", {
-                    "default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                    "tooltip": "Penalty scaled by how often a token has already appeared, "
-                               "discouraging repetition.",
-                }),
-                "disable_thinking": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "If enabled, disables the model's internal 'thinking'/reasoning "
-                               "mode (for models that support it) so it responds directly.",
-                }),
-                "startup_timeout_s": ("INT", {
-                    "default": 60, "min": 5, "max": 300,
-                    "tooltip": "How many seconds to wait for llama-server to report healthy "
-                               "before giving up on startup.",
-                }),
-                "request_timeout_s": ("INT", {
-                    "default": 300, "min": 30, "max": 1800,
-                    "tooltip": "How many seconds to wait for a response to the captioning "
-                               "request before timing out.",
                 }),
                 "max_video_frames": ("INT", {
                     "default": 16, "min": 1, "max": 64,
@@ -317,34 +281,6 @@ class LlamaServerVisionCaption:
                     "default": True,
                     "tooltip": "If enabled, prefixes each video frame image with a text label "
                                "like '[Video frame N of M]'.",
-                }),
-                "keep_server_alive": ("BOOLEAN", {
-                    "default": False, "label": "Keep server alive (reuse across runs)",
-                    "tooltip": "Keep llama-server running after this node finishes so future "
-                               "runs can reuse it instead of restarting (faster, but keeps "
-                               "VRAM occupied).",
-                }),
-                "idle_timeout_s": ("INT", {
-                    "default": 60, "min": 0, "max": 3600,
-                    "label": "Auto-unload idle timeout (0=never)",
-                    "tooltip": "If a kept-alive server goes unused for this many seconds, it "
-                               "will be automatically killed to free VRAM. 0 disables "
-                               "auto-unload.",
-                }),
-                "force_restart": ("BOOLEAN", {
-                    "default": False, "label": "Force restart server (ignore existing)",
-                    "tooltip": "Kill and restart any matching existing server before running, "
-                               "even if one is already alive and healthy.",
-                }),
-                "debug": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Print the raw JSON response from llama-server to the console "
-                               "for troubleshooting.",
-                }),
-                "server_log_path": ("STRING", {
-                    "default": DEFAULT_LOG_PATH,
-                    "tooltip": "File path where llama-server's stdout/stderr log will be "
-                               "written — check this file if startup fails.",
                 }),
             },
             "optional": {
@@ -359,25 +295,10 @@ class LlamaServerVisionCaption:
                     "tooltip": "A sequence of image frames (e.g. from a video) to sample and "
                                "send to the model, subject to max_video_frames.",
                 }),
-                "stop_sequences": ("STRING", {
-                    "multiline": True, "default": "",
-                    "tooltip": "One stop string per line; generation halts early if any of "
-                               "these strings are produced.",
-                }),
-                "extra_server_args": ("STRING", {
-                    "default": "",
-                    "tooltip": "Additional raw command-line arguments passed through to "
-                               "llama-server (advanced use).",
-                }),
-                "threads": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "label": "CPU threads (0=auto)",
-                    "tooltip": "Number of CPU threads for generation. 0 = let llama-server "
-                               "auto-detect.",
-                }),
-                "threads_batch": ("INT", {
-                    "default": 0, "min": 0, "max": 256, "label": "Batch threads (0=auto)",
-                    "tooltip": "Number of CPU threads for batch/prompt processing. 0 = let "
-                               "llama-server auto-detect.",
+                "advanced_options": ("LLAMA_VISION_OPTS", {
+                    "tooltip": "Optional settings from a 'CC Llama Vision Advanced Options' "
+                               "node — sampling, performance, lifecycle, and diagnostics. If "
+                               "not connected, sensible defaults are used.",
                 }),
             },
         }
@@ -572,15 +493,38 @@ class LlamaServerVisionCaption:
             _running_servers[key] = (proc, time.time(), log_f)
 
     def run(self, llama_server_path, models_dir, model_path, mmproj_path,
-            system_prompt, user_prompt, port, n_gpu_layers, ctx_size,
-            max_tokens, seed, temperature, top_p, top_k, min_p,
-            repeat_penalty, presence_penalty, frequency_penalty,
-            disable_thinking, startup_timeout_s, request_timeout_s,
-            max_video_frames, label_video_frames, keep_server_alive,
-            force_restart, idle_timeout_s, debug, server_log_path,
+            system_prompt, user_prompt, port, max_tokens,
+            max_video_frames, label_video_frames,
             image=None, image_batch=None, video_frames=None,
-            stop_sequences="", extra_server_args="",
-            threads=0, threads_batch=0):
+            advanced_options=None):
+
+        # Fill in anything not supplied by an "Advanced Options" node.
+        opts = dict(DEFAULT_ADVANCED_OPTS)
+        if advanced_options:
+            opts.update(advanced_options)
+
+        n_gpu_layers = opts["n_gpu_layers"]
+        ctx_size = opts["ctx_size"]
+        threads = opts["threads"]
+        threads_batch = opts["threads_batch"]
+        extra_server_args = opts["extra_server_args"]
+        seed = opts["seed"]
+        temperature = opts["temperature"]
+        top_p = opts["top_p"]
+        top_k = opts["top_k"]
+        min_p = opts["min_p"]
+        repeat_penalty = opts["repeat_penalty"]
+        presence_penalty = opts["presence_penalty"]
+        frequency_penalty = opts["frequency_penalty"]
+        disable_thinking = opts["disable_thinking"]
+        stop_sequences = opts["stop_sequences"]
+        startup_timeout_s = opts["startup_timeout_s"]
+        request_timeout_s = opts["request_timeout_s"]
+        keep_server_alive = opts["keep_server_alive"]
+        idle_timeout_s = opts["idle_timeout_s"]
+        force_restart = opts["force_restart"]
+        debug = opts["debug"]
+        server_log_path = opts["server_log_path"]
 
         # Persist the models_dir the user is actually using, so it's
         # remembered as the default next time ComfyUI (re)loads this node.
@@ -728,6 +672,171 @@ class LlamaServerVisionCaption:
                 print("[LlamaServer] Temporary server stopped.")
 
 
+# ---- Advanced Options node ----
+# Feeds a bundle of sampling / performance / lifecycle / diagnostics settings
+# into LlamaServerVisionCaption's optional "advanced_options" input, so the
+# main node's widget list stays focused on model selection, prompts, and
+# media. Leaving this node disconnected is equivalent to using the defaults
+# below (kept in sync via DEFAULT_ADVANCED_OPTS).
+class LlamaVisionAdvancedOptions:
+    @classmethod
+    def INPUT_TYPES(cls):
+        d = DEFAULT_ADVANCED_OPTS
+        return {
+            "required": {
+                "temperature": ("FLOAT", {
+                    "default": d["temperature"], "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Sampling temperature. Higher = more random/creative, lower = "
+                               "more deterministic/focused.",
+                }),
+                "top_p": ("FLOAT", {
+                    "default": d["top_p"], "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling threshold — only tokens within this cumulative "
+                               "probability mass are considered.",
+                }),
+                "top_k": ("INT", {
+                    "default": d["top_k"], "min": 0, "max": 1000,
+                    "tooltip": "Only the top K most likely tokens are considered at each step. "
+                               "0 disables this filter.",
+                }),
+                "min_p": ("FLOAT", {
+                    "default": d["min_p"], "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Minimum probability (relative to the top token) a token must "
+                               "have to be considered.",
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": d["repeat_penalty"], "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty applied to tokens that have already appeared, to "
+                               "discourage repetition.",
+                }),
+                "presence_penalty": ("FLOAT", {
+                    "default": d["presence_penalty"], "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty applied per unique token already present in the output, "
+                               "encouraging new topics.",
+                }),
+                "frequency_penalty": ("FLOAT", {
+                    "default": d["frequency_penalty"], "min": -2.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Penalty scaled by how often a token has already appeared, "
+                               "discouraging repetition.",
+                }),
+                "seed": ("INT", {"default": d["seed"], "min": -1, "max": 0xFFFFFFFFFFFFFFFF,
+                                  "control_after_generate": "fixed",
+                                  "tooltip": "Random seed for generation. -1 for random each run; "
+                                            "a fixed value makes output reproducible."}),
+                "disable_thinking": ("BOOLEAN", {
+                    "default": d["disable_thinking"],
+                    "tooltip": "If enabled, disables the model's internal 'thinking'/reasoning "
+                               "mode (for models that support it) so it responds directly.",
+                }),
+                "stop_sequences": ("STRING", {
+                    "multiline": True, "default": d["stop_sequences"],
+                    "tooltip": "One stop string per line; generation halts early if any of "
+                               "these strings are produced.",
+                }),
+                "n_gpu_layers": ("INT", {
+                    "default": d["n_gpu_layers"], "min": 0, "max": 200,
+                    "tooltip": "Number of model layers to offload to GPU. Higher = faster but "
+                               "more VRAM; set to 0 for CPU-only.",
+                }),
+                "ctx_size": ("INT", {
+                    "default": d["ctx_size"], "min": 512, "max": 131072,
+                    "tooltip": "Context window size (tokens) for the server. Larger allows "
+                               "longer prompts/images but uses more VRAM/RAM.",
+                }),
+                "threads": ("INT", {
+                    "default": d["threads"], "min": 0, "max": 256, "label": "CPU threads (0=auto)",
+                    "tooltip": "Number of CPU threads for generation. 0 = let llama-server "
+                               "auto-detect.",
+                }),
+                "threads_batch": ("INT", {
+                    "default": d["threads_batch"], "min": 0, "max": 256,
+                    "label": "Batch threads (0=auto)",
+                    "tooltip": "Number of CPU threads for batch/prompt processing. 0 = let "
+                               "llama-server auto-detect.",
+                }),
+                "extra_server_args": ("STRING", {
+                    "default": d["extra_server_args"],
+                    "tooltip": "Additional raw command-line arguments passed through to "
+                               "llama-server (advanced use).",
+                }),
+                "keep_server_alive": ("BOOLEAN", {
+                    "default": d["keep_server_alive"], "label": "Keep server alive (reuse across runs)",
+                    "tooltip": "Keep llama-server running after this node finishes so future "
+                               "runs can reuse it instead of restarting (faster, but keeps "
+                               "VRAM occupied).",
+                }),
+                "idle_timeout_s": ("INT", {
+                    "default": d["idle_timeout_s"], "min": 0, "max": 3600,
+                    "label": "Auto-unload idle timeout (0=never)",
+                    "tooltip": "If a kept-alive server goes unused for this many seconds, it "
+                               "will be automatically killed to free VRAM. 0 disables "
+                               "auto-unload.",
+                }),
+                "force_restart": ("BOOLEAN", {
+                    "default": d["force_restart"], "label": "Force restart server (ignore existing)",
+                    "tooltip": "Kill and restart any matching existing server before running, "
+                               "even if one is already alive and healthy.",
+                }),
+                "startup_timeout_s": ("INT", {
+                    "default": d["startup_timeout_s"], "min": 5, "max": 300,
+                    "tooltip": "How many seconds to wait for llama-server to report healthy "
+                               "before giving up on startup.",
+                }),
+                "request_timeout_s": ("INT", {
+                    "default": d["request_timeout_s"], "min": 30, "max": 1800,
+                    "tooltip": "How many seconds to wait for a response to the captioning "
+                               "request before timing out.",
+                }),
+                "debug": ("BOOLEAN", {
+                    "default": d["debug"],
+                    "tooltip": "Print the raw JSON response from llama-server to the console "
+                               "for troubleshooting.",
+                }),
+                "server_log_path": ("STRING", {
+                    "default": d["server_log_path"],
+                    "tooltip": "File path where llama-server's stdout/stderr log will be "
+                               "written — check this file if startup fails.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("LLAMA_VISION_OPTS",)
+    RETURN_NAMES = ("advanced_options",)
+    FUNCTION = "build"
+    CATEGORY = "llama.cpp"
+
+    def build(self, temperature, top_p, top_k, min_p, repeat_penalty,
+              presence_penalty, frequency_penalty, seed, disable_thinking,
+              stop_sequences, n_gpu_layers, ctx_size, threads, threads_batch,
+              extra_server_args, keep_server_alive, idle_timeout_s,
+              force_restart, startup_timeout_s, request_timeout_s, debug,
+              server_log_path):
+        return ({
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repeat_penalty": repeat_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "seed": seed,
+            "disable_thinking": disable_thinking,
+            "stop_sequences": stop_sequences,
+            "n_gpu_layers": n_gpu_layers,
+            "ctx_size": ctx_size,
+            "threads": threads,
+            "threads_batch": threads_batch,
+            "extra_server_args": extra_server_args,
+            "keep_server_alive": keep_server_alive,
+            "idle_timeout_s": idle_timeout_s,
+            "force_restart": force_restart,
+            "startup_timeout_s": startup_timeout_s,
+            "request_timeout_s": request_timeout_s,
+            "debug": debug,
+            "server_log_path": server_log_path,
+        },)
+
+
 # ---- VRAM handoff node ----
 # llama-server runs as an external subprocess, so ComfyUI's own model
 # manager has no idea it is holding VRAM. If a workflow does
@@ -803,9 +912,11 @@ class LlamaServerUnload:
 # ---- ComfyUI Node Registration ----
 NODE_CLASS_MAPPINGS = {
     "LlamaServerVisionCaption": LlamaServerVisionCaption,
+    "LlamaVisionAdvancedOptions": LlamaVisionAdvancedOptions,
     "LlamaServerUnload": LlamaServerUnload,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaServerVisionCaption": "CC Llama Vision",
+    "LlamaVisionAdvancedOptions": "CC Llama Vision Advanced Options",
     "LlamaServerUnload": "CC Llama Server Unload (free VRAM)",
 }
