@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-cc_llama_vision"
 description = "Yet another llama_cpp node. GGUF-focused vision-language captioning via llama-server, with automatic server lifecycle management and VRAM-safe handoff."
-version = "1.1.0"
+version = "1.1.1"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }

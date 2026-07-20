@@ -1,3 +1,4 @@
+import atexit
 import base64
 import hashlib
 import io
@@ -172,6 +173,9 @@ def _tensor_to_data_url(image_tensor, format="JPEG") -> str:
     img = image_tensor[0].cpu().numpy()
     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
     pil_img = Image.fromarray(img)
+    if pil_img.mode != "RGB":
+        # JPEG can't encode RGBA/L etc.; some upstream nodes emit 4-channel images
+        pil_img = pil_img.convert("RGB")
     buf = io.BytesIO()
     pil_img.save(buf, format=format, quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -190,6 +194,34 @@ def _kill_server_proc(proc: subprocess.Popen, timeout: int = 10, log_handle: Opt
             log_handle.close()
         except Exception:
             pass
+
+
+def _kill_tracked_servers_on_port(port: int, reason: str = "") -> bool:
+    """Kill and forget any tracked server bound to `port`, regardless of its
+    config key. Needed when the server config changed (new model, ctx, etc.):
+    the old server lives under a different key but still owns the port."""
+    killed = False
+    for key, (proc, _, log_f) in list(_running_servers.items()):
+        if key[0] == port:
+            if proc.poll() is None:
+                msg = f"[LlamaServer] Stopping server on port {port}"
+                if reason:
+                    msg += f" ({reason})"
+                print(msg)
+            _kill_server_proc(proc, timeout=5, log_handle=log_f)
+            del _running_servers[key]
+            killed = True
+    return killed
+
+
+def _cleanup_all_servers() -> None:
+    """atexit hook: don't let kept-alive llama-server processes outlive ComfyUI."""
+    for key, (proc, _, log_f) in list(_running_servers.items()):
+        _kill_server_proc(proc, timeout=5, log_handle=log_f)
+        del _running_servers[key]
+
+
+atexit.register(_cleanup_all_servers)
 
 
 # ---- Dynamic models-dir API route ----
@@ -421,10 +453,16 @@ class LlamaServerVisionCaption:
                 # Process dead – remove from registry
                 del _running_servers[key]
 
-        # If port still in use, raise error (unless it's our just-killed process)
+        # A tracked server with a *different* config key may still own this
+        # port (e.g. the user switched models). Restart it instead of erroring.
+        if _kill_tracked_servers_on_port(port, reason="server config changed"):
+            time.sleep(0.2)
+
+        # If the port is still in use it belongs to a foreign process
         if _port_in_use(port):
             raise RuntimeError(
-                f"Port {port} is already in use. Please free it or choose a different port."
+                f"Port {port} is already in use by another process. "
+                "Please free it or choose a different port."
             )
 
         # Start new server
@@ -436,6 +474,7 @@ class LlamaServerVisionCaption:
             "-m", model_path,
             "--mmproj", mmproj_path,
             "--port", str(port),
+            "--host", "127.0.0.1",
             "-ngl", str(n_gpu_layers),
             "--ctx-size", str(ctx_size),
             "--jinja",
@@ -446,9 +485,18 @@ class LlamaServerVisionCaption:
             cmd += ["--threads-batch", str(threads_batch)]
         if extra_server_args.strip():
             try:
-                cmd.extend(shlex.split(extra_server_args, posix=os.name != "nt"))
+                tokens = shlex.split(extra_server_args, posix=os.name != "nt")
             except ValueError as exc:
                 raise ValueError(f"Could not parse extra_server_args: {exc}") from exc
+            if os.name == "nt":
+                # Non-posix shlex keeps surrounding quotes on tokens; strip
+                # them so quoted paths with spaces aren't passed to the server
+                # with literal quote characters embedded.
+                tokens = [
+                    t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
+                    for t in tokens
+                ]
+            cmd.extend(tokens)
 
         creationflags = 0
         if os.name == "nt":
@@ -459,6 +507,7 @@ class LlamaServerVisionCaption:
             os.makedirs(log_dir, exist_ok=True)
         log_f = open(server_log_path, "w", encoding="utf-8", errors="replace")
 
+        proc = None
         try:
             print(f"[LlamaServer] Starting server on port {port}...")
             proc = subprocess.Popen(
@@ -470,20 +519,22 @@ class LlamaServerVisionCaption:
 
             if not _wait_for_health(port, startup_timeout_s, proc):
                 if proc.poll() is not None:
-                    log_f.close()
                     raise RuntimeError(
                         f"llama-server exited early (code {proc.poll()}). Check log: {server_log_path}"
                     )
-                else:
-                    log_f.close()
-                    raise RuntimeError(
-                        f"llama-server did not become healthy within {startup_timeout_s}s. Check log: {server_log_path}"
-                    )
+                raise RuntimeError(
+                    f"llama-server did not become healthy within {startup_timeout_s}s. Check log: {server_log_path}"
+                )
 
             print(f"[LlamaServer] Server ready on port {port}")
             _running_servers[key] = (proc, time.time(), log_f)
             return proc
         except Exception:
+            # Never leave a half-started server holding the port/VRAM (e.g. a
+            # slow model load that missed the startup timeout but is still
+            # running and would otherwise keep loading in the background).
+            if proc is not None:
+                _kill_server_proc(proc, timeout=5)
             log_f.close()
             raise
 
@@ -549,11 +600,15 @@ class LlamaServerVisionCaption:
                 server_key = self._server_key(port, model_path, mmproj_path, ctx_size,
                                               n_gpu_layers, extra_server_args, threads, threads_batch)
             else:
-                # Start a temporary server (will be killed after request)
+                # Start a temporary server (will be killed after request).
+                # A kept-alive server from an earlier run may still own the
+                # port; temp mode wants a fresh server, so stop ours first.
+                if _kill_tracked_servers_on_port(port, reason="keep_server_alive disabled"):
+                    time.sleep(0.2)
                 if _port_in_use(port):
                     raise RuntimeError(
-                        f"Port {port} is already in use. Either free it, choose another port, "
-                        "or enable 'keep_server_alive' to reuse an existing server."
+                        f"Port {port} is already in use by another process. "
+                        "Either free it or choose a different port."
                     )
                 proc = self._get_or_start_server(
                     llama_server_path, model_path, mmproj_path, port,
@@ -598,12 +653,16 @@ class LlamaServerVisionCaption:
                 user_content = user_prompt
 
             # ---- Prepare API payload ----
+            # Only send a system message when there is one; some chat
+            # templates render an empty system block badly.
+            messages = []
+            if system_prompt.strip():
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": user_content})
+
             payload = {
                 "model": "vision-caption",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
+                "messages": messages,
                 "max_tokens": max_tokens,
                 "seed": seed,
                 "temperature": temperature,
@@ -620,7 +679,13 @@ class LlamaServerVisionCaption:
                 payload["stop"] = stops
 
             if disable_thinking:
-                payload["chat_template_kwargs"] = {"thinking": False}
+                # Template kwarg naming varies by model family (Qwen3/GLM use
+                # 'enable_thinking', others use 'thinking'); templates ignore
+                # kwargs they don't reference, so sending both is safe.
+                payload["chat_template_kwargs"] = {
+                    "thinking": False,
+                    "enable_thinking": False,
+                }
 
             # ---- Send request ----
             resp = requests.post(
@@ -663,12 +728,14 @@ class LlamaServerVisionCaption:
         finally:
             # If not keeping alive, kill the temporary server
             if not keep_server_alive and proc is not None:
-                _kill_server_proc(proc, timeout=10)
-                # Remove from registry if present (shouldn't be)
-                for key, (p, _, log_f) in list(_running_servers.items()):
-                    if p == proc:
+                # Grab the registry entry first so its log handle gets closed too
+                log_f = None
+                for key, (p, _, lf) in list(_running_servers.items()):
+                    if p is proc:
+                        log_f = lf
                         del _running_servers[key]
                         break
+                _kill_server_proc(proc, timeout=10, log_handle=log_f)
                 print("[LlamaServer] Temporary server stopped.")
 
 
@@ -768,9 +835,10 @@ class LlamaVisionAdvancedOptions:
                 "idle_timeout_s": ("INT", {
                     "default": d["idle_timeout_s"], "min": 0, "max": 3600,
                     "label": "Auto-unload idle timeout (0=never)",
-                    "tooltip": "If a kept-alive server goes unused for this many seconds, it "
-                               "will be automatically killed to free VRAM. 0 disables "
-                               "auto-unload.",
+                    "tooltip": "If a kept-alive server has gone unused for this many seconds, "
+                               "it is killed to free VRAM. The check runs when a CC Llama "
+                               "Vision node next executes (there is no background timer). "
+                               "0 disables auto-unload.",
                 }),
                 "force_restart": ("BOOLEAN", {
                     "default": d["force_restart"], "label": "Force restart server (ignore existing)",

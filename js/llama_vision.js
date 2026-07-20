@@ -22,6 +22,16 @@ app.registerExtension({
             const setComboValues = (widget, values) => {
                 if (!widget || !values?.length) return;
                 widget.options = widget.options || {};
+                const current = widget.value;
+                const isPlaceholder =
+                    typeof current !== "string" || !current || current.startsWith("(no .gguf");
+                if (!values.includes(current) && !isPlaceholder) {
+                    // Keep a saved selection that isn't in the rescanned list
+                    // (e.g. a workflow from another machine) instead of
+                    // silently switching models; the backend reports a clear
+                    // error at run time if the file really is missing.
+                    values = [current, ...values];
+                }
                 widget.options.values = values;
                 if (!values.includes(widget.value)) {
                     widget.value = values[0];
